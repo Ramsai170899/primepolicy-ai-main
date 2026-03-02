@@ -6,29 +6,70 @@ if (!process.env.GEMINI_API_KEY) {
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-/**
- * Helper to wrap functions with exponential backoff retry logic.
- */
-async function withRetry<T>(fn: () => Promise<T>, maxRetries = 3, baseDelay = 1000): Promise<T> {
-    let lastError: any;
-    for (let i = 0; i <= maxRetries; i++) {
-        try {
-            return await fn();
-        } catch (error: any) {
-            lastError = error;
-            const isServiceError = error.message?.includes("503") ||
-                error.message?.includes("Service Unavailable") ||
-                error.message?.includes("429") ||
-                error.message?.includes("Too Many Requests");
+// Concurrency control to prevent hitting rate limits during orchestration
+let activeRequests = 0;
+const MAX_CONCURRENT_REQUESTS = 2; // Gemini Flash Tier allows ~15 RPM, let's play safe
+const requestQueue: (() => void)[] = [];
 
-            if (!isServiceError || i === maxRetries) {
-                break;
-            }
+async function acquireSlot() {
+    if (activeRequests < MAX_CONCURRENT_REQUESTS) {
+        activeRequests++;
+        return;
+    }
+    return new Promise<void>(resolve => {
+        requestQueue.push(resolve);
+    });
+}
 
-            const delay = baseDelay * Math.pow(2, i);
-            console.warn(`[GEMINI] Transient error: ${error.message}. Retrying in ${delay}ms... (Attempt ${i + 1}/${maxRetries})`);
-            await new Promise(resolve => setTimeout(resolve, delay));
+function releaseSlot() {
+    activeRequests--;
+    if (requestQueue.length > 0) {
+        const next = requestQueue.shift();
+        if (next) {
+            activeRequests++;
+            next();
         }
+    }
+}
+
+/**
+ * Helper to wrap functions with exponential backoff retry logic and jitter.
+ */
+async function withRetry<T>(fn: () => Promise<T>, maxRetries = 10, baseDelay = 2000): Promise<T> {
+    let lastError: any;
+
+    // Always wait for a slot before making the request
+    await acquireSlot();
+
+    try {
+        for (let i = 0; i <= maxRetries; i++) {
+            try {
+                return await fn();
+            } catch (error: any) {
+                lastError = error;
+                const isServiceError =
+                    error.message?.includes("503") ||
+                    error.message?.includes("Service Unavailable") ||
+                    error.message?.includes("429") ||
+                    error.message?.includes("Too Many Requests") ||
+                    error.message?.includes("Deadline Exceeded");
+
+                if (!isServiceError || i === maxRetries) {
+                    break;
+                }
+
+                // Exponential backoff with jitter
+                const backoff = baseDelay * Math.pow(2, i);
+                const jitter = Math.random() * 1000;
+                const delay = backoff + jitter;
+
+                console.warn(`[GEMINI] rate/service error: ${error.message.substring(0, 100)}. Retrying in ${Math.round(delay)}ms... (Attempt ${i + 1}/${maxRetries})`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
+    } finally {
+        // Release slot regardless of success or final failure
+        releaseSlot();
     }
     throw lastError;
 }
